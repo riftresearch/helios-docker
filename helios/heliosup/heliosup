@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -e
+
+# modified from https://github.com/foundry-rs/foundry/blob/master/foundryup/foundryup
+
+REPO="a16z/helios"
+NAME=helios
+
+DIR=$HOME/.$NAME
+BIN_DIR=$DIR/bin
+
+# Parse command line arguments
+NIGHTLY=false
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --nightly)
+      NIGHTLY=true
+      shift
+      ;;
+    *)
+      echo "Unknown option: $1"
+      echo "Usage: $0 [--nightly]"
+      exit 1
+      ;;
+  esac
+done
+
+# delete existing binaries
+rm -f $BIN_DIR/$NAME
+
+# Get the appropriate release tag
+if [ "$NIGHTLY" = true ]; then
+  # For nightly, get the most recent release (including pre-releases)
+  TAG=$(curl -s https://api.github.com/repos/$REPO/releases | jq -r '.[0].tag_name')
+else
+  # For stable, get the latest non-pre-release
+  TAG=$(curl -s https://api.github.com/repos/$REPO/releases/latest | grep -o '"tag_name": "[^"]*' | grep -o '[^"]*$')
+fi
+
+PLATFORM="$(uname -s)"
+case $PLATFORM in
+  Linux)
+    PLATFORM="linux"
+    ;;
+  Darwin)
+    PLATFORM="darwin"
+    ;;
+  *)
+    err "unsupported platform: $PLATFORM"
+    ;;
+esac
+
+ARCHITECTURE="$(uname -m)"
+if [ "${ARCHITECTURE}" = "x86_64" ]; then
+  # Redirect stderr to /dev/null to avoid printing errors if non Rosetta.
+  if [ "$(sysctl -n sysctl.proc_translated 2>/dev/null)" = "1" ]; then
+    ARCHITECTURE="arm64" # Rosetta.
+  else
+    ARCHITECTURE="amd64" # Intel.
+  fi
+elif [ "${ARCHITECTURE}" = "arm64" ] ||[ "${ARCHITECTURE}" = "aarch64" ] ; then
+  ARCHITECTURE="arm64" # 64-bit Arm.
+elif [ "${ARCHITECTURE}" = "armv7l" ]; then
+  ARCHITECTURE="armv7l" # 32-bit Arm.
+elif [ "${ARCHITECTURE}" = "riscv64" ]; then
+  ARCHITECTURE="riscv64gc" # 64-bit integer RISC-V with MAFDC extensions.
+else
+  ARCHITECTURE="amd64" # Amd.
+fi
+
+TARBALL_URL="https://github.com/$REPO/releases/download/${TAG}/${NAME}_${PLATFORM}_${ARCHITECTURE}.tar.gz"
+
+if [ "$NIGHTLY" = true ]; then
+  echo "Installing $NAME nightly version $TAG..."
+else
+  echo "Installing $NAME stable version $TAG..."
+fi
+
+curl -L $TARBALL_URL | tar -xzC $BIN_DIR
+
+if [ "$NIGHTLY" = true ]; then
+  echo "Installed $NAME nightly version $TAG"
+else
+  echo "Installed $NAME stable version $TAG"
+fi
