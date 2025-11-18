@@ -1,0 +1,55 @@
+[package]
+name = "helios-ethereum"
+version.workspace = true
+edition = "2021"
+
+[dependencies]
+# consensus
+alloy-trie.workspace = true
+tree_hash.workspace = true
+revm.workspace = true
+
+# config
+figment = { version = "0.10.7", features = ["toml", "env"] }
+serde_yaml = "0.9.14"
+strum = { version = "0.26.2", features = ["derive"] }
+url = {version = "2.5.0", features = ["serde"] }
+
+# async/futures
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+
+# io
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+#misc
+alloy.workspace = true
+eyre.workspace = true
+hex.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+superstruct.workspace = true
+retri.workspace = true
+typenum.workspace = true
+libmdbx.workspace = true
+
+# self crates
+helios-common = { path = "../common" }
+helios-core = { path = "../core" }
+helios-consensus-core = { path = "consensus-core" }
+helios-revm-utils = { path = "../revm-utils"  }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4.37"
+getrandom = { version = "0.3.1", features = ["wasm_js"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+openssl.workspace = true
+dirs = "5.0.1"
+
+[target.wasm32-unknown-unknown.dependencies]
+parking_lot = { version = "0.12.2" }

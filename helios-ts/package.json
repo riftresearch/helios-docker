@@ -1,0 +1,64 @@
+{
+  "name": "@a16z/helios",
+  "description": "A fast, secure, and portable multichain light client for Ethereum",
+  "version": "0.10.2",
+  "main": "./dist/lib.umd.js",
+  "module": "./dist/lib.mjs",
+  "types": "./dist/lib.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/lib.d.ts",
+      "import": "./dist/lib.mjs",
+      "require": "./dist/lib.umd.js"
+    }
+  },
+  "scripts": {
+    "build": "npm run build:wasm && npm run build:js",
+    "build:js": "vite build && npm run build:types",
+    "build:wasm": "wasm-pack build --target web --out-name index --out-dir pkg",
+    "build:types": "tsc --emitDeclarationOnly",
+    "test": "echo \"No tests yet\" && exit 0",
+    "prepack": "cp ../LICENSE LICENSE && rm -f pkg/.gitignore",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "ethereum",
+    "light-client",
+    "blockchain",
+    "multichain",
+    "wasm",
+    "rust"
+  ],
+  "author": "a16z crypto",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/a16z/helios.git",
+    "directory": "helios-ts"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "homepage": "https://github.com/a16z/helios",
+  "bugs": {
+    "url": "https://github.com/a16z/helios/issues"
+  },
+  "devDependencies": {
+    "@rollup/plugin-wasm": "^6.2.2",
+    "@types/uuid": "^10.0.0",
+    "typescript": "^5.8.3",
+    "vite": "^6.3.5",
+    "wasm-pack": "^0.13.1"
+  },
+  "dependencies": {
+    "eventemitter3": "^5.0.1",
+    "uuid": "^11.0.5"
+  },
+  "files": [
+    "dist",
+    "pkg/**/*.js",
+    "pkg/**/*.d.ts",
+    "pkg/**/*.wasm",
+    "lib.ts"
+  ]
+}
