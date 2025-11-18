@@ -1,0 +1,57 @@
+# Git files
+.git/
+.gitignore
+.gitattributes
+
+# Documentation
+*.md
+LICENSE
+helios/LICENSE
+helios/*.md
+
+# CI/CD
+.github/
+helios/.github/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Build artifacts
+helios/target/
+**/target/
+**/*.rs.bk
+**/*.pdb
+
+# Node modules (for helios-ts)
+**/node_modules/
+**/.next/
+
+# Test files
+helios/tests/
+helios/benches/
+
+# Examples
+helios/examples/
+
+# Scripts
+helios/scripts/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Temporary files
+*.log
+*.tmp
+tmp/
+temp/
+
+# OS files
+.DS_Store
+Thumbs.db
+
