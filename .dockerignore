@@ -30,12 +30,12 @@ helios/target/
 **/node_modules/
 **/.next/
 
-# Test files
-helios/tests/
-helios/benches/
+# Test data only (keep structure for Cargo.toml references)
+helios/tests/testdata/
 
-# Examples
-helios/examples/
+# Example data only
+helios/examples/*.json
+helios/examples/*.txt
 
 # Scripts
 helios/scripts/
