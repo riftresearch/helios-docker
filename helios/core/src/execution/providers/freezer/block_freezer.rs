@@ -14,6 +14,7 @@ use rayon::prelude::*;
 use libmdbx::orm::{Database, DatabaseChart, table, table_info};
 use std::sync::LazyLock;
 use tracing::{debug, error, info, warn};
+use tokio::sync::mpsc;
 
 use helios_common::{
     execution_provider::{AccountProvider, BlockProvider},
@@ -21,6 +22,12 @@ use helios_common::{
 };
 
 use crate::execution::providers::historical::HistoricalBlockProvider;
+
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
+
+const NETWORK_BATCH_SIZE: u64 = 10;
+// Pipeline buffer size
+const CHANNEL_BUFFER: usize = 16;
 
 table!(
     /// Set of finalized block hashes - acts as a hash set for existence checks
@@ -240,8 +247,6 @@ where
     // Re-query freezer_tip every 60 seconds and repeat
     
     let mut retry_delay = Duration::from_secs(1);
-    const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
-    const BATCH_SIZE: u64 = 32;
 
     loop {
         let freezer_tip = match get_freezer_tip::<N, H, E>(&historical, &execution).await {
@@ -256,12 +261,11 @@ where
 
         match process_backfill(
             &db,
-            &execution,
+            execution.clone(),
             freezer_tip,
             &mut last_stored_block,
             &last_block_path,
             archive_from,
-            BATCH_SIZE,
         )
         .await
         {
@@ -282,14 +286,14 @@ where
 
 /// Process backfill logic - backfill backwards from freezer_tip to last_stored_block (or archive_from)
 /// Uses freezer_tip as root of trust and verifies parent chain backwards
+/// Implements a 3-stage pipeline: Downloader -> Verifier -> Persister
 async fn process_backfill<N, E>(
     db: &Arc<Database>,
-    execution: &Arc<E>,
+    execution: Arc<E>,
     freezer_tip: N::BlockResponse,
     last_stored_block: &mut Option<N::BlockResponse>,
     last_block_path: &PathBuf,
     archive_from: u64,
-    batch_size: u64,
 ) -> Result<()>
 where
     N: NetworkSpec,
@@ -318,67 +322,275 @@ where
     let mut total_blocks_processed = 1u64;
     let total_blocks_to_process = freezer_tip_number - lower_exclusive;
     
-    let mut current_end = freezer_tip_number - 1;
-    
-    while current_end > lower_exclusive {
-        let start = std::cmp::max(current_end.saturating_sub(batch_size - 1), lower_inclusive);
-        
-        debug!("Backfilling backwards from {} to {}", start, current_end);
+    // Pipeline Configuration
+    let (downloader_tx, downloader_rx) = mpsc::channel(CHANNEL_BUFFER);
+    let (verifier_tx, mut verifier_rx) = mpsc::channel(CHANNEL_BUFFER);
 
-        // Fetch and verify blocks
-        let blocks = fetch_and_verify_blocks::<N, E>(execution, start, current_end).await?;
+    // Stage 1: Downloader
+    let execution_clone = execution.clone();
+    let downloader_handle = tokio::spawn(async move {
+        let result = spawn_downloader::<N, E>(
+            execution_clone,
+            lower_inclusive,
+            freezer_tip_number - 1, // Start below tip
+            NETWORK_BATCH_SIZE,
+            downloader_tx
+        ).await;
+        if let Err(ref e) = result {
+            error!("Downloader task error: {}", e);
+        }
+        result
+    });
+
+    // Stage 2: Verifier
+    let verifier_handle = tokio::spawn(async move {
+        let result = spawn_verifier::<N>(
+            downloader_rx,
+            verifier_tx
+        ).await;
+        if let Err(ref e) = result {
+            error!("Verifier task error: {}", e);
+        }
+        result
+    });
+
+    // Stage 3: Persister (Main Loop)
+    let mut pipeline_error = None;
+    let mut persister_blocks_processed = 0u64;
+    let mut persister_last_log_time = start_time;
+
+    while let Some(blocks) = verifier_rx.recv().await {
+        // Blocks are already sorted descending by the Verifier stage
         
-        // Verify the last block (highest number) matches our expected parent
-        if let Some(last_block) = blocks.last() {
-            let last_block_hash = last_block.header().hash();
-            if last_block_hash != expected_parent_hash {
-                return Err(eyre!(
+        if let Some(first_block) = blocks.first() {
+            let first_block_hash = first_block.header().hash();
+            if first_block_hash != expected_parent_hash {
+                pipeline_error = Some(eyre!(
                     "Parent hash mismatch at block {}: expected {}, got {}",
-                    last_block.header().number(),
+                    first_block.header().number(),
                     expected_parent_hash,
-                    last_block_hash
+                    first_block_hash
                 ));
+                break;
             }
             
-            if let Some(first_block) = blocks.first() {
-                expected_parent_hash = first_block.header().parent_hash();
+            // The LAST block in the vector is the LOWEST number, which points to the next parent we need
+            if let Some(last_block) = blocks.last() {
+                expected_parent_hash = last_block.header().parent_hash();
             }
         }
-        
+
         let hashes: Vec<[u8; 32]> = blocks.iter().map(|b| b.header().hash().into()).collect();
-        store_block_hashes(Arc::clone(db), hashes).await?;
+        if let Err(e) = store_block_hashes(Arc::clone(db), hashes).await {
+            pipeline_error = Some(e);
+            break;
+        }
+
         
         total_blocks_processed += blocks.len() as u64;
+        persister_blocks_processed += blocks.len() as u64;
         
         let now = tokio::time::Instant::now();
-        if now.duration_since(last_log_time) >= Duration::from_secs(5) {
+        if now.duration_since(last_log_time) >= Duration::from_secs(1) {
             let elapsed = now.duration_since(start_time).as_secs_f64();
             let blocks_per_sec = total_blocks_processed as f64 / elapsed;
             let progress_percent = (total_blocks_processed as f64 / total_blocks_to_process as f64) * 100.0;
             
             info!(
-                "Freezer sync progress: {}/{} blocks ({:.1}%) | {:.1} blocks/sec | current: {}",
+                "Freezer backfill progress: {}/{} blocks ({:.1}%) | {:.1} blocks/sec",
                 total_blocks_processed,
                 total_blocks_to_process,
                 progress_percent,
                 blocks_per_sec,
-                current_end
             );
             
             last_log_time = now;
         }
         
-        current_end = start - 1;
+        if now.duration_since(persister_last_log_time) >= Duration::from_secs(5) {
+            let persister_elapsed = now.duration_since(start_time).as_secs_f64();
+            let persister_rate = persister_blocks_processed as f64 / persister_elapsed;
+            debug!("Persister: {:.1} blocks/sec", persister_rate);
+            persister_last_log_time = now;
+        }
+    }
+
+    // Check for errors from tasks or loop
+    if let Some(e) = pipeline_error {
+        // Abort tasks
+        downloader_handle.abort();
+        verifier_handle.abort();
+        return Err(e);
+    }
+    
+    // Check task results
+    match downloader_handle.await {
+        Ok(Ok(())) => debug!("Downloader completed successfully"),
+        Ok(Err(e)) => return Err(e.wrap_err("Downloader returned error")),
+        Err(e) if e.is_cancelled() => debug!("Downloader was cancelled"),
+        Err(e) => return Err(eyre!("Downloader task panicked: {}", e)),
+    }
+    
+    match verifier_handle.await {
+        Ok(Ok(())) => debug!("Verifier completed successfully"),
+        Ok(Err(e)) => return Err(e.wrap_err("Verifier returned error")),
+        Err(e) if e.is_cancelled() => debug!("Verifier was cancelled"),
+        Err(e) => return Err(eyre!("Verifier task panicked: {}", e)),
+    }
+
+    // Check if we actually processed everything
+    // Note: total_blocks_processed starts at 1?
+    // Wait, line 324: let mut total_blocks_processed = 1u64;
+    // Why 1? Ah, maybe because we count the freezer_tip?
+    // freezer_tip_number is inclusive. lower_exclusive is exclusive.
+    // Count = freezer_tip_number - lower_exclusive.
+    // We store freezer_tip at line 317. So that's 1 block.
+    
+    if total_blocks_processed < total_blocks_to_process {
+         return Err(eyre!(
+            "Pipeline ended prematurely: processed {}/{} blocks. Check logs for task errors.",
+            total_blocks_processed,
+            total_blocks_to_process
+        ));
     }
 
     save_last_block_number(last_block_path, freezer_tip_number)?;
     *last_stored_block = Some(freezer_tip);
 
     info!(
-        "Freezer sync complete: verified chain from block {} down to {}",
+        "Freezer backfill complete: verified chain from block {} to {}",
         freezer_tip_number,
         lower_inclusive
     );
+    Ok(())
+}
+
+/// Pipeline Stage 1: Downloader
+/// Fetches blocks backwards from end_block to start_block in batches
+async fn spawn_downloader<N, E>(
+    execution: Arc<E>,
+    start_block: u64,
+    end_block: u64,
+    batch_size: u64,
+    sender: mpsc::Sender<Vec<N::BlockResponse>>,
+) -> Result<()>
+where
+    N: NetworkSpec,
+    E: BlockProvider<N> + AccountProvider<N>,
+{
+    debug!("Downloader starting: start_block={}, end_block={}, batch_size={}", start_block, end_block, batch_size);
+    let mut current_end = end_block;
+    
+    let start_time = tokio::time::Instant::now();
+    let mut total_blocks_downloaded = 0u64;
+    let mut last_log_time = start_time;
+    
+    loop {
+        if current_end < start_block {
+            debug!("Downloader finished: current_end={} < start_block={}", current_end, start_block);
+            break;
+        }
+        
+        let start = std::cmp::max(current_end.saturating_sub(batch_size - 1), start_block);
+        debug!("Downloader: fetching blocks {} to {}", start, current_end);
+        
+        let mut retry_delay = Duration::from_secs(1);
+
+        loop {
+            match fetch_batch_blocks::<N, E>(&execution, start, current_end).await {
+                Ok(blocks) => {
+                    let block_count = blocks.len() as u64;
+                    total_blocks_downloaded += block_count;
+                    
+                    let now = tokio::time::Instant::now();
+                    if now.duration_since(last_log_time) >= Duration::from_secs(5) {
+                        let elapsed = now.duration_since(start_time).as_secs_f64();
+                        let download_rate = total_blocks_downloaded as f64 / elapsed;
+                        debug!("Downloader: {:.1} blocks/sec", download_rate);
+                        last_log_time = now;
+                    }
+                    
+                    if sender.send(blocks).await.is_err() {
+                        return Ok(()); // Receiver dropped
+                    }
+                    break; // Success, move to next batch
+                }
+                Err(e) => {
+                    if retry_delay >= MAX_RETRY_DELAY {
+                        return Err(e.wrap_err("Failed to fetch batch blocks after max retries"));
+                    }
+                    warn!("Downloader fetch error: {}. Retrying in {:?}", e, retry_delay);
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = std::cmp::min(retry_delay * 2, MAX_RETRY_DELAY);
+                }
+            }
+        }
+        
+        if start == 0 { break; }
+        current_end = start - 1;
+    }
+    
+    let total_elapsed = tokio::time::Instant::now().duration_since(start_time).as_secs_f64();
+    let final_rate = total_blocks_downloaded as f64 / total_elapsed;
+    debug!("Downloader completed: {} blocks in {:.1}s ({:.1} blocks/sec)", 
+        total_blocks_downloaded, total_elapsed, final_rate);
+    
+    Ok(())
+}
+
+/// Pipeline Stage 2: Verifier
+/// Verifies blocks CPU-intensively on thread pool
+async fn spawn_verifier<N>(
+    mut receiver: mpsc::Receiver<Vec<N::BlockResponse>>,
+    sender: mpsc::Sender<Vec<N::BlockResponse>>,
+) -> Result<()>
+where
+    N: NetworkSpec,
+{
+    let start_time = tokio::time::Instant::now();
+    let mut total_blocks_verified = 0u64;
+    let mut last_log_time = start_time;
+    
+    while let Some(blocks) = receiver.recv().await {
+        let block_count = blocks.len() as u64;
+        
+        let verified_blocks = tokio::task::spawn_blocking(move || -> Result<Vec<N::BlockResponse>> {
+            // Sort descending to verify parent chain backwards
+            let mut blocks = blocks;
+            blocks.sort_by_key(|b| std::cmp::Reverse(b.header().number()));
+            verify_parent_chain::<N>(&blocks)?;
+            
+            blocks.par_iter().try_for_each(|block| {
+                if !N::is_hash_valid(block) {
+                    Err(eyre!("Block hash invalid: {}", block.header().hash()))
+                } else {
+                    Ok(())
+                }
+            })?;
+            
+            Ok(blocks)
+        }).await??;
+
+        total_blocks_verified += block_count;
+        
+        let now = tokio::time::Instant::now();
+        if now.duration_since(last_log_time) >= Duration::from_secs(5) {
+            let elapsed = now.duration_since(start_time).as_secs_f64();
+            let verify_rate = total_blocks_verified as f64 / elapsed;
+            debug!("Verifier: {:.1} blocks/sec", verify_rate);
+            last_log_time = now;
+        }
+
+        if sender.send(verified_blocks).await.is_err() {
+            break; 
+        }
+    }
+    
+    let total_elapsed = tokio::time::Instant::now().duration_since(start_time).as_secs_f64();
+    let final_rate = total_blocks_verified as f64 / total_elapsed;
+    debug!("Verifier completed: {} blocks in {:.1}s ({:.1} blocks/sec)", 
+        total_blocks_verified, total_elapsed, final_rate);
+    
     Ok(())
 }
 
@@ -464,36 +676,7 @@ async fn store_block_hashes(db: Arc<Database>, block_hashes: Vec<[u8; 32]>) -> R
     Ok(())
 }
 
-async fn fetch_and_verify_blocks<N, E>(
-    execution: &Arc<E>,
-    start: u64,
-    end: u64,
-) -> Result<Vec<N::BlockResponse>>
-where
-    N: NetworkSpec,
-    E: BlockProvider<N> + AccountProvider<N>,
-{
-    let blocks = fetch_batch_blocks::<N, E>(execution, start, end).await?;
-
-    let blocks = tokio::task::spawn_blocking(move || -> Result<Vec<N::BlockResponse>> {
-        verify_parent_chain::<N>(&blocks)?;
-
-        blocks.par_iter().try_for_each(|block| {
-            if !N::is_hash_valid(block) {
-                Err(eyre!("Block hash invalid: {}", block.header().hash()))
-            } else {
-                Ok(())
-            }
-        })?;
-
-        Ok(blocks)
-    })
-    .await??;
-
-    Ok(blocks)
-}
-
-/// Fetch a batch of blocks in parallel
+/// Fetch a batch of blocks in parallel, maintaining order
 async fn fetch_batch_blocks<N, E>(
     execution: &Arc<E>,
     start: u64,
@@ -519,31 +702,39 @@ where
 
     let results = join_all(futures).await;
 
-    let mut blocks = Vec::new();
+    // Collect with block numbers to ensure correct ordering
+    let mut blocks_with_nums = Vec::new();
     for result in results {
         let (block_num, block_opt) = result?;
         let block = block_opt.ok_or_else(|| eyre!("Block {} not found", block_num))?;
-        blocks.push(block);
+        blocks_with_nums.push((block_num, block));
     }
+    
+    // Sort by block number to ensure ascending order
+    blocks_with_nums.sort_by_key(|(num, _)| *num);
+    
+    let blocks: Vec<N::BlockResponse> = blocks_with_nums.into_iter().map(|(_, block)| block).collect();
 
     Ok(blocks)
 }
 
 /// Verify that blocks form a valid parent chain
+/// Expects blocks in DESCENDING order (highest number first)
 fn verify_parent_chain<N>(blocks: &[N::BlockResponse]) -> Result<()>
 where
     N: NetworkSpec,
 {
     for i in 1..blocks.len() {
-        let prev_hash = blocks[i - 1].header().hash();
-        let curr_parent = blocks[i].header().parent_hash();
+        let curr_hash = blocks[i].header().hash();
+        let prev_parent = blocks[i - 1].header().parent_hash();
 
-        if prev_hash != curr_parent {
+        if curr_hash != prev_parent {
                 return Err(eyre!(
-                "Parent chain verification failed at block {}: expected parent {}, got {}",
+                "Parent chain verification failed at block {}: block hash {}, but next block {} expects parent {}",
                 blocks[i].header().number(),
-                prev_hash,
-                curr_parent
+                curr_hash,
+                blocks[i - 1].header().number(),
+                prev_parent
                 ));
             }
         }
@@ -564,8 +755,8 @@ where
     let Some(latest_block) = execution.get_block(BlockId::Number(BlockNumberOrTag::Latest), false).await? else {
         return Err(eyre!("failed to get latest block"));
     };
-    // Use latest - 1000 blocks as finalized proxy (OP Stack/Linea don't populate finalized_block_recv)
-    let finalized_block_number = latest_block.header().number().saturating_sub(1000);
+    // Use latest - 8191 / 2 blocks as finalized proxy (OP Stack/Linea don't populate finalized_block_recv)
+    let finalized_block_number = latest_block.header().number().saturating_sub(8191/2);
     let finalized_block = BlockId::Number(BlockNumberOrTag::Number(finalized_block_number));
     let Some(finalized_block) = historical.get_historical_block(finalized_block, false, execution.as_ref()).await? else {
         return Err(eyre!("failed to get finalized block"));
